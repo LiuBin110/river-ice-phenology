@@ -1,0 +1,191 @@
+// // Define the region of interest (ROI) for the Yellow River area
+// var roi = YR.geometry();
+
+// // Define the range of years
+// var years = ee.List.sequence(2018, 2023);
+
+// // Define cloud masking function
+// function maskS2clouds(image) {
+//   var qa = image.select('QA60');
+
+//   // Bits 10 and 11 are clouds and cirrus, respectively.
+//   var cloudBitMask = 1 << 10;
+//   var cirrusBitMask = 1 << 11;
+
+//   // Both flags should be set to zero to indicate clear conditions.
+//   var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+//       .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+//   return image.updateMask(mask).divide(10000);
+// }
+
+// // Create a dictionary to store sample points for each year
+// var samplePoints = {
+//   '2018': samples2018,
+//   '2019': samples2019,
+//   '2020': samples2020,
+//   '2021': samples2021,
+//   '2022': samples2022,
+//   '2023': samples2023,
+//   // // Load and add other years' sample points to the dictionary if needed
+//   // //...
+// };
+
+// Map.centerObject(roi, 8);
+
+// //////////////////////////////////////////////////////////////////  
+// // Define sample extraction function
+// function extractSamples(year) {
+//   var startDate = ee.Date.fromYMD(year, 12, 1);
+//   var endDate = ee.Date.fromYMD(year + 1, 2, 28);
+//   var winterImage = Sentinel2.filterBounds(roi)
+//                       .filterDate(startDate, endDate)
+//                       .map(maskS2clouds)
+//                       .median()
+//                       .clip(roi)
+//                       .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']);
+
+//   var samples = samplePoints[year.toString()];
+//   if (!samples) {
+//     print('No samples found for year: ', year);
+//     return null;
+//   }
+
+//   var sampled = winterImage.sampleRegions({
+//     collection: samples,
+//     properties: ['class'],
+//     scale: 10,
+//     geometries: true
+//   }).map(function(sample) {
+//     return sample.set('year', year);
+//   });
+
+//   print('Sampled points for year: ', year, sampled);
+
+//   return sampled;
+// }
+// //////////////////////////////////////////////////////////////////
+
+// // Get list of years and convert to local array
+// var yearsList = years.getInfo();
+// print('Years: ', yearsList);
+
+// var allSamples = [];
+
+// // Loop through years and extract samples
+// yearsList.forEach(function(year) {
+//   var samples = extractSamples(year);
+//   if (samples) {
+//     allSamples.push(samples);
+//   }
+// });
+
+// // Merge all samples into one FeatureCollection
+// var Samples = ee.FeatureCollection(allSamples).flatten();
+// print('Sample size: ', Samples.size());  // Display sample size
+
+// // Export merged samples to Earth Engine Asset
+// Export.table.toAsset({
+//   collection: Samples,
+//   description: 'Sentinel2_samples2018-2023',
+// });
+
+
+// Load existing samples directly from GEE asset
+var Samples = ee.FeatureCollection('projects/liubin/assets/River_ice_water_sampling_sites/Sentinel2_samples2018-2023'); 
+
+// Display the sample size
+print('Sample size: ', Samples.size());
+
+// Split samples into training and validation sets
+var sampleCount = Samples.size();
+var withRandom = Samples.randomColumn('random');
+var split = 0.7;  // 70% for training, 30% for validation
+var trainingPartition = withRandom.filter(ee.Filter.lt('random', split));
+var validationPartition = withRandom.filter(ee.Filter.gte('random', split));
+
+// Define Random Forest classifier
+var classifier = ee.Classifier.smileRandomForest(55).train({
+  features: trainingPartition,
+  classProperty: 'class',
+  inputProperties: ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']
+});
+
+// Validate classifier accuracy
+var validation = validationPartition.classify(classifier);
+
+// Calculate confusion matrix
+var testConfusionMatrix = validation.errorMatrix('class', 'classification', [1, 2]);
+print('Validation error matrix: ', testConfusionMatrix);
+
+// Calculate overall accuracy
+var overallAccuracy = testConfusionMatrix.accuracy();
+print('Overall accuracy: ', overallAccuracy);
+
+// Calculate Kappa coefficient
+var kappa = testConfusionMatrix.kappa();
+print('Kappa coefficient: ', kappa);
+
+// Calculate Producer's Accuracy
+var PA = testConfusionMatrix.producersAccuracy();
+print("Producer's Accuracy (split 7:3):", PA);
+
+// Calculate User's Accuracy
+var UA = testConfusionMatrix.consumersAccuracy();
+print("User's Accuracy (split 7:3):", UA);
+
+///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+// Tune the Random Forest parameter: number of trees from 1 to 100 (step 2)
+var numTreesList = ee.List.sequence(1, 100, 2);
+
+// Run training and validation for each number of trees
+var accuracies = numTreesList.map(function(numTrees) {
+  var classifier = ee.Classifier.smileRandomForest(numTrees)
+      .train({
+        features: trainingPartition,
+        classProperty: 'class',
+        inputProperties: ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']
+      });
+  return validationPartition
+    .classify(classifier)
+    .errorMatrix('class', 'classification', [1, 2])
+    .accuracy();
+});
+
+// Show hyperparameter tuning results
+var chart = ui.Chart.array.values({
+  array: ee.Array(accuracies),
+  axis: 0,
+  xLabels: numTreesList
+  }).setOptions({
+      title: 'Hyperparameter Tuning for the Number of Trees',
+      vAxis: {title: 'Overall accuracy'},
+      hAxis: {title: 'Number of Trees', gridlines: {count: 11}}
+  });
+print(chart);
+
+// Random Forest variable importance
+// Convert classifier result to dictionary
+var dict = classifier.explain();
+print("Random Forest Variable Importance: ",dict);
+
+// Get the "importance" list
+var variable_importance = ee.Feature(null, ee.Dictionary(dict).get('importance'));
+
+// Visualize variable importance
+var importancechart = ui.Chart.feature.byProperty(variable_importance)
+              .setChartType('ColumnChart')
+              .setOptions({
+                  title: 'Random Forest Variable Importance',
+                  legend: {position: 'none'},
+                  hAxis: {title: 'Bands'},
+                  vAxis: {title: 'Importance'}
+              });
+print(importancechart);
+
+// Export classifier to Earth Engine Asset
+Export.classifier.toAsset({
+  classifier:classifier,
+  description:'Sentinel2_RF_classifier',
+});
