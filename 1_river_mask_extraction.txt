@@ -1,0 +1,114 @@
+// Study Area
+var RiverBuffer = river.geometry();
+
+// Cloud masking for Landsat 30m HLS data
+function rmL30Cloud(image) { 
+  var CloudBitMask = (1 << 1); 
+  var CloudShadowBitMask = (1 << 3); 
+  var qa = image.select('Fmask'); 
+  var mask = qa.bitwiseAnd(CloudBitMask).eq(0) 
+                 .and(qa.bitwiseAnd(CloudShadowBitMask).eq(0)); 
+  return image.updateMask(mask)
+              .copyProperties(image)
+              .copyProperties(image, ['system:time_start']);
+}
+
+// Otsu's thresholding function
+var otsu = function(histogram) {
+  // Get pixel counts and gray values from histogram
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram')); // Pixel counts
+  var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans')); // Gray values
+  var size = means.length().get([0]); // Size of histogram
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]); // Total pixels
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]); // Total sum
+  var mean = sum.divide(total); // Mean gray value
+  
+  var indices = ee.List.sequence(1, size);
+
+  // Calculate between-class variance for each possible threshold
+  var bss = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]); // Pixels in first group
+    var aMeans = means.slice(0, 0, i);
+    var aMean = aMeans.multiply(aCounts)
+        .reduce(ee.Reducer.sum(), [0]).get([0])
+        .divide(aCount); // Mean of first group
+    var bCount = total.subtract(aCount); // Pixels in second group
+    var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount); // Mean of second group
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+           bCount.multiply(bMean.subtract(mean).pow(2)));
+  });
+  // Print between-class variance vs. threshold
+  print(ui.Chart.array.values(ee.Array(bss), 0, means));
+  // Return the mean with maximum between-class variance
+  return means.sort(bss).get([-1]);
+};
+
+// Time period definition
+var startYear = 2013;
+var endYear = 2023;
+
+// Loop through image collections for each year
+for (var year = startYear; year <= endYear; year++) {
+  
+  // Data filtering
+  var collection = ee.ImageCollection('NASA/HLS/HLSL30/v002')
+                      .filterDate(year + '-09-01', year + '-12-01') 
+                      .filterBounds(river)
+                      .map(rmL30Cloud);
+  
+  print(collection);
+  
+  var median = collection.median().clip(river);
+  var mndwi1 = median.clip(RiverBuffer).normalizedDifference(['B3','B6']).rename(['MNDWI']);
+  var mndwi2 = mndwi1.multiply(10000);
+
+  // Compute MNDWI histogram
+  var histogram = mndwi2.select('MNDWI').reduceRegion({
+    reducer: ee.Reducer.histogram(255, 2)
+        .combine('mean', null, true)
+        .combine('variance', null, true), 
+    geometry: RiverBuffer, 
+    scale: 30,
+    bestEffort: true
+  });
+  // print(histogram);
+
+  // //Chart the histogramprint
+  // print(Chart.image.histogram(mndwi2.select('MNDWI'), RiverBuffer, 30));
+  
+  // Identify optimal threshold using Otsu's method
+  var threshold = otsu(histogram.get('MNDWI_histogram')).divide(10000);
+  var water_mask = mndwi1.select('MNDWI').gt(threshold);
+  
+  print('Threshold_' + year, threshold);  
+
+  var visParam1 = {
+    min: -1.0,
+    max: 1.0,
+    palette: ['74A901', '0000FF']
+  };
+  
+  var visParam2 = {
+    bands: ['B4', 'B3', 'B2'],
+    min:0.01,
+    max:0.3,
+  };
+
+  Map.centerObject(RiverBuffer, 7);
+  Map.addLayer(median, visParam2, 'RGB_' + year);
+  // Map.addLayer(mndwi1, visParam1, 'MNDWI_' + year);
+  Map.addLayer(water_mask.mask(water_mask), {palette: 'red'}, 'Water_' + year);
+  
+  // Export water mask image
+  Export.image.toDrive({
+    image:water_mask,
+    description: 'Water_' + year,
+    scale:30,
+    region:RiverBuffer,
+    folder: 'GEE_exports',
+    maxPixels:1e13,
+    crs: 'EPSG:4326',
+  });
+
+}
