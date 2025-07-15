@@ -1,0 +1,62 @@
+// Define the region of interest (ROI) for the Yellow River area
+var roi = YR.geometry();
+
+// Define the range of years
+var years = ee.List.sequence(2023, 2023);
+
+// Cloud masking function for Sentinel-2
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 represent clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero to indicate clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+// Generate and display winter composite images for each year
+years.getInfo().forEach(function(year) {
+  // Define the winter period for the current year
+  var startDate = ee.Date.fromYMD(year, 12, 1);
+  var endDate = ee.Date.fromYMD(year + 1, 2, 28);
+
+  // Filter images within ROI and the winter period, then compute the median composite
+  var winterImage = Sentinel2.filterBounds(roi)
+                       .filterDate(startDate, endDate)
+                       .map(maskS2clouds) // Remove clouds
+                       .median()
+                       .clip(roi);
+                       
+  // Calculate elevation and slope
+  var alos = ee.Image("JAXA/ALOS/AW3D30/V2_2").clip(roi);
+  var elevation = alos.select('AVE_DSM').rename('elev');
+  var slope = ee.Terrain.slope(elevation).rename('slope'); // Slope in degrees
+  var ndsi = winterImage.normalizedDifference(['B3', 'B11']).rename('NDSI');
+  
+  var clippedImage = winterImage.addBands(elevation)
+                                .addBands(slope)
+                                .addBands(ndsi);
+                                
+  var maskedImage = clippedImage.updateMask(ndsi.gt(0).and(slope.lt(12)));
+  print(year + '-' + (year + 1) + ' NDSI > 0 and slope < 12:', maskedImage);
+
+  // Add the winter composite and masked image to the map for visualization
+  Map.addLayer(winterImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.5, gamma: 1.4}, 'Winter Image ' + year + '-' + (year + 1));
+  Map.addLayer(maskedImage, {bands: ['B11', 'B3', 'B2'], min: 0, max: 0.5, gamma: 1.4}, 'Masked Winter Image ' + year + '-' + (year + 1));
+});
+
+Map.centerObject(roi, 8);
+
+// Merge all water and ice samples into a single FeatureCollection
+var samples2023 = waterSamples.merge(iceSamples);
+
+// Export the 2023 samples as an Earth Engine asset
+Export.table.toAsset({
+  collection: samples2023,
+  description: 'samples2023',
+});
