@@ -3,12 +3,10 @@ Code for river ice phenology extraction based on remote sensing
 
 ## Google Earth Engine Scripts
 
-This repository also contains key GEE scripts used for river ice phenology extraction:
+All main scripts used in this study are available in the `GEE_Scripts` folder:
+- `1_river_mask_extraction.txt`: River channel mask extraction
+- `2_sample_selection.txt`: Sample selection for ice/water
+- `3_rf_model_training.txt`: Random Forest model training
+- `4_ice_extraction.txt`: Automated river ice extraction
 
-- `1_river_mask_extraction.js`: River channel mask extraction
-- `2_sample_selection.js`: Manual sample selection for ice/water classification
-- `3_rf_model_training.js`: Random Forest model training
-- `4_ice_extraction.js`: Automated river ice extraction and area calculation
-
-Each script is commented in English for clarity.  
-Please see individual script files for further details and usage instructions.
+All scripts are in plain text for easy copy and use in the GEE code editor.
