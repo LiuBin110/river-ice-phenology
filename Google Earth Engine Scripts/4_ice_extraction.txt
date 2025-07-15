@@ -1,0 +1,268 @@
+// Define the region of interest (ROI)
+var YR = ee.FeatureCollection('projects/liubin/assets/IMYR_Buffer_Zones/IMYR_1500m_Buffer_Zones');
+var roi = YR.filter(ee.Filter.eq('Num', 65)).geometry();
+Map.centerObject(roi, 12);
+Map.addLayer(roi, {}, "ROI");
+
+// Load the sub-region (subROI) from asset and calculate its intersection with the ROI
+var subROI = ee.FeatureCollection('projects/liubin/assets/Water_Feature/Water_Feature_2023');
+var subROIGeometry = subROI.geometry().intersection(roi);  // Compute intersection of subROI and ROI
+Map.addLayer(subROIGeometry, {color: 'red'}, 'SubROI Intersection');
+
+// Filter the image collection (using only cloud mask)
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    // .filterDate('2019-11-01', '2020-03-01')
+    .filterDate('2024-04-01', '2024-05-01')
+    .filterBounds(roi)
+    .map(maskS2clouds);
+
+// // Define the original cloud mask function
+// function maskS2clouds(image) {
+//   var qa = image.select('QA60');
+//   // Bits 10 and 11 represent clouds and cirrus, respectively
+//   var cloudBitMask = 1 << 10;
+//   var cirrusBitMask = 1 << 11;
+//   // Both bits should be 0, indicating clear conditions
+//   var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+//       .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+//   // Apply mask and normalize
+//   var maskedImage = image.updateMask(mask).divide(10000);
+//   // Copy original image properties
+//   return maskedImage.copyProperties(image, image.propertyNames());
+// }
+
+// Modified cloud mask function using SCL band
+function maskS2clouds(image) {
+  var scl = image.select('SCL');
+  // Define SCL values to mask
+  var cloudValues = [3, 8, 9, 10]; // 3: cloud shadow, 8: medium probability cloud, 9: high probability cloud, 10: thin cirrus
+  // Create mask to retain non-cloud pixels
+  var mask = scl.remap(cloudValues, ee.List.repeat(0, cloudValues.length), 1).eq(1);
+  // Apply mask and retain properties
+  return image.updateMask(mask).divide(10000).copyProperties(image, image.propertyNames());
+}
+
+// Calculate elevation and slope
+var alos = ee.Image("JAXA/ALOS/AW3D30/V2_2").clip(roi);
+var elevation = alos.select('AVE_DSM').rename('elev');
+var slope = ee.Terrain.slope(elevation).rename('slope'); // Slope in degrees
+
+// Get number of images
+var imageCount = dataset.size().getInfo();
+print('Number of images:', imageCount);
+
+// Calculate ROI area
+var roiArea = roi.area().getInfo();
+
+// Sort the image collection by time
+var sortedImages = dataset.sort('system:time_start');
+
+// Get all images in the collection
+var imagesList = sortedImages.toList(sortedImages.size());
+
+// Visualization parameters for true color (RGB) images
+var visParams = {
+  bands: ['B4', 'B3', 'B2'],  // RGB bands for Sentinel-2
+  min: 0,
+  max: 0.5,
+  gamma: 1.4
+};
+
+// Set maximum number of images to display
+var maxImages = 100;  // Adjust as needed
+
+// Initialize set of displayed dates
+var displayedDates = [];
+
+// Initialize maximum total area of ice and water
+var maxIceWaterArea = 0;
+
+// Load classification model
+var classifier = ee.Classifier.load('projects/liubin/assets/RF_Model/Sentinel2_RF_classifier');
+
+// Function to calculate the fraction of valid pixels in ROI
+function validPixelFraction(image, roi) {
+  var validPixels = image.select(0).mask().reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: 10,
+    maxPixels: 1e9
+  });
+  var totalPixels = roi.area().divide(100);  // Assume 10m resolution, pixel area is 100 sq meters
+  return ee.Number(validPixels.get(image.bandNames().get(0))).divide(totalPixels);
+}
+
+// Function to calculate ice and water area
+function calculateIceAndWaterArea(classifiedImage, subROIGeometry) {
+  var iceMask = classifiedImage.eq(2);  // Class 2: ice
+  var waterMask = classifiedImage.eq(1);  // Class 1: water
+
+  var iceArea = iceMask.multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: subROIGeometry,
+    scale: 10,
+    maxPixels: 1e9
+  }).get('classification');
+
+  var waterArea = waterMask.multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: subROIGeometry,
+    scale: 10,
+    maxPixels: 1e9
+  }).get('classification');
+
+  return {
+    iceArea: ee.Number(iceArea),
+    waterArea: ee.Number(waterArea)
+  };
+}
+
+// Export image function
+function exportImage(image, date, region) {
+  Export.image.toDrive({
+    image: image,
+    description: date + '_Ice',
+    scale: 10,
+    region: region,
+    fileNamePrefix: date + '_Ice',
+    fileFormat: 'GeoTIFF'
+  });
+}
+
+// Array to store details of processed images
+var processedImagesData = [];
+
+// Variable to count the number of processed images
+var processedImagesCount = 0;
+
+// Loop through the image collection and process each image
+for (var i = 0; i < Math.min(imageCount, maxImages); i++) {
+  var image = ee.Image(imagesList.get(i));
+
+  // Get the acquisition time of the image
+  var time_start = image.get('system:time_start').getInfo();
+
+  // Check if 'system:time_start' exists
+  if (time_start !== null && time_start !== undefined) {
+    var date = ee.Date(time_start).format('YYYY-MM-dd').getInfo();
+
+    // Check if the date has already been processed
+    if (displayedDates.indexOf(date) === -1) {
+
+      // Calculate intersection geometry between image and ROI
+      var intersection = image.geometry().intersection(roi);
+
+      // Get intersection area
+      var intersectionArea = intersection.area().getInfo();
+
+      // Check the fraction of valid pixels
+      var validFraction = validPixelFraction(image, roi).getInfo();
+
+      // Ensure image covers at least 99% of the ROI and valid pixel fraction > 80%
+      if (intersectionArea / roiArea > 0.99 && validFraction > 0.8) {
+        processedImagesCount++;
+
+        // Clip image to ROI for displaying RGB image
+        var clippedToROI = image.clip(roi);
+
+        // Add RGB image to the map, showing the entire ROI
+        Map.addLayer(clippedToROI, visParams, date + ' RGB in ROI');
+
+        // Calculate NDSI and slope, and apply mask
+        var ndsi = image.normalizedDifference(['B3', 'B11']).rename('NDSI');
+        var imageWithBands = image.addBands(ndsi).addBands(elevation).addBands(slope);
+        var filteredImage = imageWithBands.updateMask(ndsi.gt(0).and(slope.lt(12)));
+
+        // Clip image to subROI intersection for classification
+        var clippedToSubROI = filteredImage.clip(subROIGeometry);
+
+        // Classify the image
+        var classifiedImage = clippedToSubROI.classify(classifier);
+
+        // Extract ice class only
+        var iceOnly = classifiedImage.updateMask(classifiedImage.eq(2)); // ice
+
+        // Add classified layer to the map, limited to subROI intersection
+        Map.addLayer(iceOnly, {palette: 'cyan'}, date + ' Ice in SubROI');
+
+        // Calculate ice and water area
+        var areas = calculateIceAndWaterArea(classifiedImage, subROIGeometry);
+        var iceArea = areas.iceArea.getInfo();
+        var waterArea =  areas.waterArea.getInfo();
+        var iceWaterArea = iceArea + waterArea;
+
+        if (iceWaterArea > maxIceWaterArea) {
+          maxIceWaterArea = iceWaterArea;  // Update the maximum ice+water area
+        }
+
+        // Export ice image
+        exportImage(iceOnly, date, subROIGeometry);
+
+        // Store the details of the processed image
+        processedImagesData.push({
+          date: date,
+          classifiedImage: classifiedImage,
+          iceArea: iceArea,
+          waterArea: waterArea
+        });
+
+        // Mark the date as processed
+        displayedDates.push(date);
+        
+        // … The previous step has calculated clippedToROI, classifiedImage, iceOnly, date, roi, subROIGeometry, etc …
+
+        //  Export the RGB original image
+        Export.image.toDrive({
+             image: clippedToROI.select(['B4','B3','B2']),
+             description: date + '_RGB',
+             folder:      'GEE_Exports',
+             fileNamePrefix: date + '_RGB',
+             region:      roi,
+             scale:       10,
+             maxPixels:   1e13
+           });
+        
+      }
+    }
+  } else {
+    print('Image missing system:time_start property and will be skipped.');
+  }
+}
+
+// Output the actual number of processed images
+print('Number of processed images:', processedImagesCount);
+
+// Second loop: calculate ice fraction for each image
+processedImagesData.forEach(function(item) {
+  var iceFraction = item.iceArea / maxIceWaterArea;  // Use the saved max ice+water area to compute fraction
+  print(item.date + ' Ice fraction: ', iceFraction);
+});
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+// Create lists of dates and ice fractions
+var dates = processedImagesData.map(function(item) {
+  return item.date;
+});
+
+var iceFractions = processedImagesData.map(function(item) {
+  var iceFraction = item.iceArea / maxIceWaterArea;
+  return iceFraction;
+});
+
+// Use ui.Chart to create a time series line chart of ice fraction
+var chart = ui.Chart.array.values({
+  array: ee.List(iceFractions),
+  axis: 0,
+  xLabels: ee.List(dates)
+})
+.setChartType('LineChart')  // Set as line chart
+.setOptions({
+  title: 'Ice Fraction Over Time',
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'Ice Fraction'},
+  pointSize: 5,
+  lineWidth: 2,
+  series: {
+    0: {color: 'blue'}  // Optional: set line color to blue
+  }
+});
